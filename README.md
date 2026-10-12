@@ -50,7 +50,8 @@ needs configuring.
 
 ```sh
 pio device monitor         # JSON log of every scan, 115200 baud (Ctrl-C to stop)
-pio check                  # static analysis (cppcheck) of src/
+pio test -e native         # unit tests, run on this machine (see Testing)
+pio check                  # static analysis (cppcheck) of src/ and lib/
 ```
 
 Opening the folder in VS Code with the PlatformIO extension gives IntelliSense
@@ -73,6 +74,47 @@ pio run -e t-dongle-s3-jtag -t upload
 
 If the picture is upside down for the way you hold it, change
 `-DSCREEN_ROTATION=1` to `3` in `platformio.ini` and reflash.
+
+## Testing
+
+The code is split so that most of it can be tested without a dongle:
+
+- `lib/survey/` holds everything that does not need a radio or a screen: the
+  AP and BLE tables (smoothing, sorting, forgetting, recycling when full),
+  advertisement decoding (maker IDs, iBeacon, Eddystone, service UUIDs), the
+  button gesture decoder, the view/highlight navigation, and the JSON log
+  line formatting. It has no Arduino dependency.
+- `src/main.cpp` is the glue: Wi-Fi and NimBLE drivers, the display, the LED
+  and the serial port.
+
+**Unit tests** live in `test/` and run on your machine with PlatformIO's
+Unity runner. They take a couple of seconds:
+
+```sh
+pio test -e native
+```
+
+They cover the colour bands in the legend above, the 3:1 RSSI smoothing
+(including that it settles on the true level when a signal fades), the
+three-missed-sweeps and ten-second forgetting rules, what happens when a
+table is full, the exact JSON each record produces, a real iBeacon payload,
+and every button gesture including hold auto-repeat and `millis()` rollover.
+
+**Smoke test on the dongle.** With a flashed dongle plugged in:
+
+```sh
+python3 hil/check_dongle.py
+```
+
+It listens to the log for a few seconds on each radio, drives the firmware
+through the same serial letters the button gestures map to, and checks that
+every line is valid JSON with the documented fields, that press and hold move
+through the views in the documented order, that both radios produce sweeps,
+and that the firmware never resets. It needs `pyserial`; the Python that
+ships with PlatformIO already has it.
+
+**CI.** `.github/workflows/ci.yml` runs the unit tests, builds the firmware
+and runs `pio check` on every push and pull request.
 
 ## Using it
 

@@ -11,7 +11,7 @@
 //   hold          - move to the next item (in the list, or while looking at one);
 //                   keep holding and it keeps stepping
 //
-// The RGB LED mirrors the colour of the highlighted item (List view) or the
+// The RGB LED mirrors the colour of the highlighted item (List nav.view) or the
 // item being looked at (Details / Track), so you can watch coverage without
 // reading the tiny screen.
 //
@@ -31,11 +31,39 @@
 #include <algorithm>
 #include <cstring>
 
+// Everything that does not need the radios or the screen lives in lib/survey
+// so it can be unit-tested on the host (pio test -e native).
+#include <survey/ble_table.h>
+#include <survey/button.h>
+#include <survey/navigator.h>
+#include <survey/rssi.h>
+#include <survey/text.h>
+#include <survey/wifi_table.h>
+
+// The library mirrors a few ESP-IDF / NimBLE enum values so it can stay free
+// of their headers. Catch any drift here.
+static_assert(survey::AUTH_OPEN == WIFI_AUTH_OPEN && survey::AUTH_WEP == WIFI_AUTH_WEP &&
+              survey::AUTH_WPA == WIFI_AUTH_WPA_PSK && survey::AUTH_WPA2 == WIFI_AUTH_WPA2_PSK &&
+              survey::AUTH_WPA_WPA2 == WIFI_AUTH_WPA_WPA2_PSK && survey::AUTH_WPA2_ENT == WIFI_AUTH_WPA2_ENTERPRISE &&
+              survey::AUTH_WPA3 == WIFI_AUTH_WPA3_PSK && survey::AUTH_WPA2_WPA3 == WIFI_AUTH_WPA2_WPA3_PSK,
+              "wifi_auth_mode_t changed");
+static_assert(survey::CIPHER_NONE == WIFI_CIPHER_TYPE_NONE && survey::CIPHER_WEP40 == WIFI_CIPHER_TYPE_WEP40 &&
+              survey::CIPHER_WEP104 == WIFI_CIPHER_TYPE_WEP104 && survey::CIPHER_TKIP == WIFI_CIPHER_TYPE_TKIP &&
+              survey::CIPHER_CCMP == WIFI_CIPHER_TYPE_CCMP && survey::CIPHER_TKIP_CCMP == WIFI_CIPHER_TYPE_TKIP_CCMP &&
+              survey::CIPHER_AES_CMAC128 == WIFI_CIPHER_TYPE_AES_CMAC128 && survey::CIPHER_GCMP == WIFI_CIPHER_TYPE_GCMP &&
+              survey::CIPHER_GCMP256 == WIFI_CIPHER_TYPE_GCMP256,
+              "wifi_cipher_type_t changed");
+static_assert(survey::SECOND_NONE == WIFI_SECOND_CHAN_NONE && survey::SECOND_ABOVE == WIFI_SECOND_CHAN_ABOVE &&
+              survey::SECOND_BELOW == WIFI_SECOND_CHAN_BELOW, "wifi_second_chan_t changed");
+static_assert(survey::ADDR_PUBLIC == BLE_ADDR_PUBLIC, "BLE address type changed");
+
 #ifndef SCREEN_ROTATION
 #define SCREEN_ROTATION 1
 #endif
 
 namespace {
+
+using namespace survey;
 
 // ---------------------------------------------------------------- hardware --
 constexpr int W = 160;
@@ -46,31 +74,13 @@ constexpr int LED_DI_PIN = 40;   // APA102 data
 constexpr int LED_CI_PIN = 39;   // APA102 clock
 
 // ---------------------------------------------------------------- tuning ----
-constexpr uint32_t DEBOUNCE_MS    = 30;
-constexpr uint32_t DOUBLE_MS      = 350;   // second press within this = double press
-constexpr uint32_t LONG_PRESS_MS  = 600;
-constexpr uint32_t HOLD_REPEAT_MS = 350;   // while still held, repeat the hold action this often
+// Button timing, table sizes and staleness live in lib/survey.
 constexpr uint32_t SCAN_MS_PER_CH = 150;   // ~2 s per full sweep of 13 channels
-constexpr uint32_t STALE_SCANS    = 3;     // forget an AP after this many missed scans
-constexpr int      MAX_APS        = 48;
-constexpr int      MAX_BLE        = 48;
-constexpr uint32_t BLE_FRESH_MS   = 2000;  // heard this recently: drawn in colour
-constexpr uint32_t BLE_STALE_MS   = 10000; // forget a BLE device after this long
 constexpr uint32_t BLE_TIDY_MS    = 500;   // re-sort and prune the BLE list
 constexpr uint32_t BLE_LOG_MS     = 2000;  // serial dump of the BLE list
 constexpr int      LIST_ROWS      = 7;
 constexpr uint32_t REDRAW_MS      = 100;
 constexpr uint8_t  LED_BRIGHTNESS = 3;     // 0..31, the LED is very bright
-
-// RSSI bands in dBm, best to worst: green / yellow / orange / red, and below
-// `poor` the bar meter is empty.
-struct RssiScale { int great, good, fair, poor; };
-// Wi-Fi: -67 is the usual floor for voice/video to work well, and anything
-// below -75 is where clients start roaming or dropping.
-constexpr RssiScale WIFI_SCALE = {-60, -67, -75, -85};
-// BLE: a phone or beacon transmits ~15 dB quieter than an AP, so the bands
-// sit lower. -75 is a comfortable floor for beacon positioning.
-constexpr RssiScale BLE_SCALE  = {-65, -75, -85, -92};
 
 // ---------------------------------------------------------------- colours ---
 constexpr uint16_t C_BG     = TFT_BLACK;
@@ -81,71 +91,12 @@ constexpr uint16_t C_DIM    = 0x7BEF;   // mid grey
 constexpr uint16_t C_FAINT  = 0x39E7;   // darker grey
 
 uint16_t rssiColor(int r, const RssiScale& s) {
-  if (r >= s.great) return TFT_GREEN;
-  if (r >= s.good)  return TFT_YELLOW;
-  if (r >= s.fair)  return TFT_ORANGE;
-  return TFT_RED;
-}
-
-int rssiBars(int r, const RssiScale& s) {
-  if (r >= s.great) return 4;
-  if (r >= s.good)  return 3;
-  if (r >= s.fair)  return 2;
-  if (r >= s.poor)  return 1;
-  return 0;
-}
-
-const char* rssiWord(int r, const RssiScale& s) {
-  if (r >= s.great) return "GREAT";
-  if (r >= s.good)  return "GOOD";
-  if (r >= s.fair)  return "FAIR";
-  if (r >= s.poor)  return "POOR";
-  return "EDGE";
-}
-
-const char* authName(uint8_t a) {
-  switch (a) {
-    case WIFI_AUTH_OPEN:            return "open";
-    case WIFI_AUTH_WEP:             return "WEP";
-    case WIFI_AUTH_WPA_PSK:         return "WPA";
-    case WIFI_AUTH_WPA2_PSK:        return "WPA2";
-    case WIFI_AUTH_WPA_WPA2_PSK:    return "WPA/WPA2";
-    case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2-ENT";
-    case WIFI_AUTH_WPA3_PSK:        return "WPA3";
-    case WIFI_AUTH_WPA2_WPA3_PSK:   return "WPA2/WPA3";
-    default:                        return "?";
+  switch (rssiBand(r, s)) {
+    case Band::Great: return TFT_GREEN;
+    case Band::Good:  return TFT_YELLOW;
+    case Band::Fair:  return TFT_ORANGE;
+    default:          return TFT_RED;
   }
-}
-
-const char* cipherName(uint8_t c) {
-  switch (c) {
-    case WIFI_CIPHER_TYPE_NONE:        return "none";
-    case WIFI_CIPHER_TYPE_WEP40:       return "WEP40";
-    case WIFI_CIPHER_TYPE_WEP104:      return "WEP104";
-    case WIFI_CIPHER_TYPE_TKIP:        return "TKIP";
-    case WIFI_CIPHER_TYPE_CCMP:        return "CCMP";
-    case WIFI_CIPHER_TYPE_TKIP_CCMP:   return "TKIP+CCMP";
-    case WIFI_CIPHER_TYPE_AES_CMAC128: return "CMAC";
-    case WIFI_CIPHER_TYPE_GCMP:        return "GCMP";
-    case WIFI_CIPHER_TYPE_GCMP256:     return "GCMP256";
-    default:                           return "?";
-  }
-}
-
-// The 6x8 font is ASCII only.
-void asciiOnly(char* s) {
-  for (; *s; ++s)
-    if ((uint8_t)*s < 0x20 || (uint8_t)*s >= 0x7F) *s = '?';
-}
-
-// Append s to buf as JSON string content (escaped), never overflowing.
-size_t jsonAppend(char* buf, size_t cap, size_t pos, const char* s) {
-  for (; *s && pos + 2 < cap; ++s) {
-    if (*s == '"' || *s == '\\') buf[pos++] = '\\';
-    buf[pos++] = ((uint8_t)*s < 0x20) ? ' ' : *s;
-  }
-  buf[pos] = '\0';
-  return pos;
 }
 
 // The USB Serial/JTAG peripheral only sends a packet shorter than 64 bytes when
@@ -166,30 +117,7 @@ Radio radio = Radio::WiFi;
 const RssiScale& scale() { return radio == Radio::WiFi ? WIFI_SCALE : BLE_SCALE; }
 
 // ---------------------------------------------------------------- AP table --
-constexpr uint8_t PHY_B  = 1;
-constexpr uint8_t PHY_G  = 2;
-constexpr uint8_t PHY_N  = 4;
-constexpr uint8_t PHY_LR = 8;   // Espressif long-range mode
-
-struct Ap {
-  uint8_t  bssid[6];
-  char     ssid[33];
-  int16_t  rssi;       // smoothed over recent scans
-  int8_t   lastRssi;   // raw value from the last scan that heard it
-  uint8_t  channel;
-  uint8_t  second;     // wifi_second_chan_t: HT20, or HT40 with the other half above/below
-  uint8_t  auth;
-  uint8_t  cipher;     // pairwise cipher
-  uint8_t  phy;        // PHY_* bits
-  bool     wps;
-  uint32_t firstSeen;  // scan number
-  uint32_t lastSeen;   // scan number
-  uint32_t seenCount;  // sweeps that heard it
-};
-
-Ap       aps[MAX_APS];
-int      apCount = 0;
-uint32_t scanNo  = 0;
+WifiTable wifi;
 bool     scanning = false;
 uint32_t scanStartedMs = 0;
 uint32_t nextScanMs = 0;
@@ -199,42 +127,11 @@ volatile uint32_t scanDoneEvents = 0;
 constexpr uint32_t SCAN_WATCHDOG_MS = 10000;
 constexpr uint32_t SCAN_GAP_MS      = 250;    // let the driver settle between sweeps
 
-int findAp(const uint8_t* bssid) {
-  for (int i = 0; i < apCount; ++i)
-    if (memcmp(aps[i].bssid, bssid, 6) == 0) return i;
-  return -1;
-}
-
-// "11b/g/n" style summary of the modes an AP advertises.
-void phyText(uint8_t phy, char* out, size_t n) {
-  size_t pos = (size_t)snprintf(out, n, "11");
-  const char* names[] = {"b", "g", "n", "lr"};
-  bool first = true;
-  for (int i = 0; i < 4 && pos < n; ++i) {
-    if (!(phy & (1 << i))) continue;
-    pos += (size_t)snprintf(out + pos, n - pos, "%s%s", first ? "" : "/", names[i]);
-    first = false;
-  }
-  if (first) strlcpy(out, "11?", n);
-}
-
 // Each record goes out as one write so the USB CDC driver moves it in whole
 // 64-byte packets instead of one byte at a time.
 void logAp(const Ap& a) {
-  char phy[12];
-  phyText(a.phy, phy, sizeof phy);
   char line[320];
-  size_t n = snprintf(line, sizeof line, "{\"scan\":%lu,\"ms\":%lu,\"ssid\":\"",
-                      (unsigned long)scanNo, (unsigned long)millis());
-  n = jsonAppend(line, sizeof line, n, a.ssid);
-  n += snprintf(line + n, sizeof line - n,
-                "\",\"bssid\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"ch\":%u,\"rssi\":%d,\"auth\":\"%s\","
-                "\"bw\":%d,\"phy\":\"%s\",\"cipher\":\"%s\",\"wps\":%s}\n",
-                a.bssid[0], a.bssid[1], a.bssid[2], a.bssid[3], a.bssid[4], a.bssid[5],
-                a.channel, a.lastRssi, authName(a.auth),
-                a.second == WIFI_SECOND_CHAN_NONE ? 20 : 40, phy, cipherName(a.cipher),
-                a.wps ? "true" : "false");
-  if (n >= sizeof line) n = sizeof line - 1;
+  const size_t n = formatApLine(line, sizeof line, a, wifi.scanNo, millis());
   Serial.write(reinterpret_cast<const uint8_t*>(line), n);
 }
 
@@ -260,157 +157,36 @@ void startScan() {
 }
 
 void ingestScan(int n) {
-  ++scanNo;
+  wifi.beginSweep();
   Serial.printf("{\"event\":\"sweep\",\"scan\":%lu,\"ms\":%lu,\"found\":%d,\"took\":%lu,\"status\":%lu}\n",
-                (unsigned long)scanNo, (unsigned long)millis(), n,
+                (unsigned long)wifi.scanNo, (unsigned long)millis(), n,
                 (unsigned long)(millis() - scanStartedMs), (unsigned long)scanDoneStatus);
   for (int i = 0; i < n; ++i) {
     const wifi_ap_record_t* rec = static_cast<const wifi_ap_record_t*>(WiFi.getScanInfoByIndex(i));
     if (!rec) continue;
-    const int rssi = rec->rssi;
-    int idx = findAp(rec->bssid);
-    if (idx < 0) {
-      if (apCount < MAX_APS) {
-        idx = apCount++;
-      } else {
-        // Table full: recycle the entry that has gone longest without being heard.
-        idx = 0;
-        for (int k = 1; k < apCount; ++k)
-          if (aps[k].lastSeen < aps[idx].lastSeen ||
-              (aps[k].lastSeen == aps[idx].lastSeen && aps[k].rssi < aps[idx].rssi))
-            idx = k;
-        if (aps[idx].lastSeen == scanNo) continue;  // everything is fresh, skip this one
-      }
-      aps[idx] = {};
-      memcpy(aps[idx].bssid, rec->bssid, 6);
-      aps[idx].rssi = rssi;
-      aps[idx].firstSeen = scanNo;
-    } else {
-      aps[idx].rssi = (aps[idx].rssi * 3 + rssi) / 4;
-    }
-    Ap& a = aps[idx];
-    strlcpy(a.ssid, reinterpret_cast<const char*>(rec->ssid), sizeof a.ssid);
-    asciiOnly(a.ssid);
-    a.lastRssi = rssi;
-    a.channel  = rec->primary;
-    a.second   = rec->second;
-    a.auth     = rec->authmode;
-    a.cipher   = rec->pairwise_cipher;
-    a.phy      = (rec->phy_11b ? PHY_B : 0) | (rec->phy_11g ? PHY_G : 0) |
-                 (rec->phy_11n ? PHY_N : 0) | (rec->phy_lr ? PHY_LR : 0);
-    a.wps      = rec->wps;
-    a.lastSeen = scanNo;
-    ++a.seenCount;
-    logAp(a);
+    ApRecord r = {};
+    memcpy(r.bssid, rec->bssid, 6);
+    r.ssid    = reinterpret_cast<const char*>(rec->ssid);
+    r.rssi    = rec->rssi;
+    r.channel = rec->primary;
+    r.second  = rec->second;
+    r.auth    = rec->authmode;
+    r.cipher  = rec->pairwise_cipher;
+    r.phy     = (rec->phy_11b ? PHY_B : 0) | (rec->phy_11g ? PHY_G : 0) |
+                (rec->phy_11n ? PHY_N : 0) | (rec->phy_lr ? PHY_LR : 0);
+    r.wps     = rec->wps;
+    if (const Ap* a = wifi.ingest(r)) logAp(*a);
   }
-
-  // Forget APs that have been silent for a while.
-  int w = 0;
-  for (int r = 0; r < apCount; ++r)
-    if (scanNo - aps[r].lastSeen < STALE_SCANS) aps[w++] = aps[r];
-  apCount = w;
-
-  std::sort(aps, aps + apCount, [](const Ap& a, const Ap& b) {
-    if (a.rssi != b.rssi) return a.rssi > b.rssi;
-    return memcmp(a.bssid, b.bssid, 6) < 0;
-  });
-
+  wifi.endSweep();
   pushSerial();
 }
 
 // ---------------------------------------------------------------- BLE table -
-constexpr int MAX_SVC = 4;   // 16-bit service UUIDs kept per device
-
-struct BleDev {
-  uint8_t  addr[6];      // as printed, most significant byte first
-  uint8_t  addrType;     // BLE_ADDR_PUBLIC or random
-  char     name[21];
-  char     tag[6];       // maker or beacon type, from the advertisement
-  int16_t  rssi;         // smoothed over recent advertisements
-  int8_t   lastRssi;     // raw value from the last advertisement
-  bool     haveMfr;
-  uint16_t company;      // Bluetooth SIG company id from the manufacturer data
-  uint8_t  mfrLen;       // manufacturer data length, bytes
-  bool     ibeacon;
-  uint16_t major, minor; // iBeacon
-  uint16_t svc[MAX_SVC]; // 16-bit service UUIDs
-  uint8_t  svcCount;     // of those
-  uint8_t  svcLong;      // 32/128-bit service UUIDs, count only
-  bool     haveTx;
-  int8_t   txPower;
-  bool     connectable;
-  uint32_t firstSeenMs;
-  uint32_t lastSeenMs;
-  uint32_t adverts;      // advertisements heard since firstSeenMs
-};
-
-// One advertisement, handed from the NimBLE host task to loop() through a
-// queue so the table above is only ever touched from one task.
-struct BleAdv {
-  uint8_t  addr[6];
-  uint8_t  addrType;
-  int8_t   rssi;
-  char     name[21];
-  char     tag[6];
-  bool     haveMfr;
-  uint16_t company;
-  uint8_t  mfrLen;
-  bool     ibeacon;
-  uint16_t major, minor;
-  uint16_t svc[MAX_SVC];
-  uint8_t  svcCount;
-  uint8_t  svcLong;
-  bool     haveTx;
-  int8_t   txPower;
-  bool     connectable;
-};
-
-BleDev            bles[MAX_BLE];
-int               bleCount = 0;
+BleTable          ble;
 uint32_t          bleSweepNo = 0;
 QueueHandle_t     bleQueue = nullptr;
 NimBLEScan*       bleScan = nullptr;
 volatile uint32_t bleDropped = 0;   // adverts lost because loop() fell behind
-
-int findBle(const uint8_t* addr) {
-  for (int i = 0; i < bleCount; ++i)
-    if (memcmp(bles[i].addr, addr, 6) == 0) return i;
-  return -1;
-}
-
-// Bluetooth SIG company identifiers that show up in a typical office, as tags
-// short enough for the list's middle column.
-const char* makerTag(uint16_t company) {
-  switch (company) {
-    case 0x004C: return "Apple";
-    case 0x0006: return "MSFT";
-    case 0x00E0: return "Googl";
-    case 0x0075: return "Samsg";
-    case 0x0087: return "Garmn";
-    case 0x0059: return "Nordc";
-    case 0x02E5: return "Espr";
-    case 0x038F: return "Xiaom";
-    case 0x0157: return "Huami";
-    case 0x01DA: return "Logi";
-    case 0x0171: return "Amazn";
-    case 0x012D: return "Sony";
-    case 0x009E: return "Bose";
-    case 0x0224: return "Fitbt";
-    case 0x05A7: return "Sonos";
-    case 0x0499: return "Ruuvi";
-    case 0x015D: return "Estmt";
-    case 0x0118: return "Radus";
-    case 0x000D: return "TI";
-    case 0x0030: return "STM";
-    case 0x0002: return "Intel";
-    case 0x000A:
-    case 0x001D: return "Qualc";
-    case 0x000F: return "Brdcm";
-    case 0x0131: return "Cyprs";
-    case 0x0822: return "Adafr";
-    default:     return "";
-  }
-}
 
 // Runs in the NimBLE host task: pack the advertisement and queue it.
 class AdvSink : public NimBLEScanCallbacks {
@@ -426,121 +202,38 @@ class AdvSink : public NimBLEScanCallbacks {
     if (d->haveTXPower()) { a.haveTx = true; a.txPower = d->getTXPower(); }
     if (d->haveManufacturerData()) {
       const std::string m = d->getManufacturerData();
-      if (m.size() >= 2) {
-        a.haveMfr = true;
-        a.company = (uint8_t)m[0] | ((uint16_t)(uint8_t)m[1] << 8);
-        a.mfrLen  = (uint8_t)std::min<size_t>(m.size(), 255);
-        if (a.company == 0x004C && m.size() >= 25 && m[2] == 0x02 && m[3] == 0x15) {
-          a.ibeacon = true;
-          a.major = ((uint16_t)(uint8_t)m[20] << 8) | (uint8_t)m[21];
-          a.minor = ((uint16_t)(uint8_t)m[22] << 8) | (uint8_t)m[23];
-        }
-        strlcpy(a.tag, a.ibeacon ? "iBcn" : makerTag(a.company), sizeof a.tag);
-      }
+      parseManufacturerData(reinterpret_cast<const uint8_t*>(m.data()), m.size(), a);
     }
     const int nSvc = d->getServiceUUIDCount();
     for (int i = 0; i < nSvc; ++i) {
       const NimBLEUUID u = d->getServiceUUID(i);
       if (u.bitSize() == 16) {
         const uint8_t* v = u.getValue();
-        if (a.svcCount < MAX_SVC) a.svc[a.svcCount++] = v[0] | ((uint16_t)v[1] << 8);
+        addService(a, (uint16_t)(v[0] | ((uint16_t)v[1] << 8)));
       } else {
-        ++a.svcLong;
+        addLongService(a);
       }
     }
-    if (!a.tag[0] && d->isAdvertisingService(NimBLEUUID((uint16_t)0xFEAA)))
-      strlcpy(a.tag, "Eddy", sizeof a.tag);
+    finishAdv(a);
     if (xQueueSend(bleQueue, &a, 0) != pdTRUE) ++bleDropped;
   }
 };
-
-void ingestBle(const BleAdv& a) {
-  const uint32_t now = millis();
-  int idx = findBle(a.addr);
-  if (idx < 0) {
-    if (bleCount < MAX_BLE) {
-      idx = bleCount++;
-    } else {
-      // Table full: recycle the entry that has gone longest without being heard.
-      idx = 0;
-      for (int k = 1; k < bleCount; ++k)
-        if (bles[k].lastSeenMs < bles[idx].lastSeenMs) idx = k;
-      if (now - bles[idx].lastSeenMs < BLE_FRESH_MS) return;  // everything is fresh, skip this one
-    }
-    BleDev& d = bles[idx];
-    d = {};
-    memcpy(d.addr, a.addr, 6);
-    d.rssi = a.rssi;
-    d.firstSeenMs = now;
-  } else {
-    bles[idx].rssi = (bles[idx].rssi * 3 + a.rssi) / 4;
-  }
-  // Fields that only some advertisements carry are kept from the last one
-  // that had them, so a device's details fill in over time.
-  BleDev& d = bles[idx];
-  d.addrType = a.addrType;
-  d.connectable = a.connectable;
-  if (a.name[0]) { strlcpy(d.name, a.name, sizeof d.name); asciiOnly(d.name); }
-  if (a.tag[0])  strlcpy(d.tag, a.tag, sizeof d.tag);
-  if (a.haveMfr) {
-    d.haveMfr = true; d.company = a.company; d.mfrLen = a.mfrLen;
-    if (a.ibeacon) { d.ibeacon = true; d.major = a.major; d.minor = a.minor; }
-  }
-  if (a.svcCount || a.svcLong) {
-    memcpy(d.svc, a.svc, sizeof d.svc);
-    d.svcCount = a.svcCount;
-    d.svcLong  = a.svcLong;
-  }
-  if (a.haveTx) { d.haveTx = true; d.txPower = a.txPower; }
-  d.lastRssi   = a.rssi;
-  d.lastSeenMs = now;
-  ++d.adverts;
-}
 
 void logBle() {
   ++bleSweepNo;
   const uint32_t now = millis();
   Serial.printf("{\"event\":\"ble_sweep\",\"scan\":%lu,\"ms\":%lu,\"found\":%d,\"dropped\":%lu}\n",
-                (unsigned long)bleSweepNo, (unsigned long)now, bleCount, (unsigned long)bleDropped);
-  for (int i = 0; i < bleCount; ++i) {
-    const BleDev& d = bles[i];
+                (unsigned long)bleSweepNo, (unsigned long)now, ble.count, (unsigned long)bleDropped);
+  for (int i = 0; i < ble.count; ++i) {
     char line[320];
-    size_t n = snprintf(line, sizeof line, "{\"scan\":%lu,\"ms\":%lu,\"name\":\"",
-                        (unsigned long)bleSweepNo, (unsigned long)now);
-    n = jsonAppend(line, sizeof line, n, d.name);
-    n += snprintf(line + n, sizeof line - n,
-                  "\",\"addr\":\"%02X:%02X:%02X:%02X:%02X:%02X\",\"type\":\"%s\",\"rssi\":%d,\"tag\":\"%s\","
-                  "\"age\":%lu,\"adv\":%lu,\"conn\":%s",
-                  d.addr[0], d.addr[1], d.addr[2], d.addr[3], d.addr[4], d.addr[5],
-                  d.addrType == BLE_ADDR_PUBLIC ? "pub" : "rnd", d.lastRssi, d.tag,
-                  (unsigned long)(now - d.lastSeenMs), (unsigned long)d.adverts,
-                  d.connectable ? "true" : "false");
-    if (d.haveMfr && n < sizeof line)
-      n += snprintf(line + n, sizeof line - n, ",\"mfr\":\"%04X\"", d.company);
-    if (d.ibeacon && n < sizeof line)
-      n += snprintf(line + n, sizeof line - n, ",\"major\":%u,\"minor\":%u", d.major, d.minor);
-    if (d.haveTx && n < sizeof line)
-      n += snprintf(line + n, sizeof line - n, ",\"tx\":%d", d.txPower);
-    if (d.svcCount && n < sizeof line) {
-      n += snprintf(line + n, sizeof line - n, ",\"svc\":[");
-      for (int k = 0; k < d.svcCount && n < sizeof line; ++k)
-        n += snprintf(line + n, sizeof line - n, "%s\"%04X\"", k ? "," : "", d.svc[k]);
-      if (n < sizeof line) n += snprintf(line + n, sizeof line - n, "]");
-    }
-    if (n < sizeof line) n += snprintf(line + n, sizeof line - n, "}\n");
-    if (n >= sizeof line) n = sizeof line - 1;
+    const size_t n = formatBleLine(line, sizeof line, ble.devs[i], bleSweepNo, now);
     Serial.write(reinterpret_cast<const uint8_t*>(line), n);
   }
   pushSerial();
 }
 
 // ---------------------------------------------------------------- UI state --
-enum class View { List, Details, Track, Channels };
-
-View     view = View::List;
-int      cursor = 0;
-uint8_t  selKey[6] = {0};        // BSSID or BLE address under the highlight
-bool     haveSel = false;
+Navigator nav;                   // nav.view on screen and the highlighted item
 char     trackSsid[33] = "";     // Wi-Fi item being looked at (Details / Track)
 uint8_t  trackBssid[6] = {0};
 bool     trackHidden = false;
@@ -551,35 +244,35 @@ bool     dirty = true;
 TFT_eSPI    tft;
 TFT_eSprite frame(&tft);
 
-int itemCount() { return radio == Radio::WiFi ? apCount : bleCount; }
+// The list the navigator moves through, for whichever radio is active.
+struct WifiItems : ItemSource {
+  int            count() const override { return wifi.count; }
+  const uint8_t* key(int i) const override { return wifi.aps[i].bssid; }
+  int            find(const uint8_t* k) const override { return wifi.find(k); }
+} wifiItems;
+struct BleItems : ItemSource {
+  int            count() const override { return ble.count; }
+  const uint8_t* key(int i) const override { return ble.devs[i].addr; }
+  int            find(const uint8_t* k) const override { return ble.find(k); }
+} bleItems;
 
-const uint8_t* itemKey(int i) { return radio == Radio::WiFi ? aps[i].bssid : bles[i].addr; }
-
-int findItem(const uint8_t* key) { return radio == Radio::WiFi ? findAp(key) : findBle(key); }
-
-// Keep the highlight on the same item when the list re-sorts.
-void resyncCursor() {
-  const int n = itemCount();
-  if (n == 0) { cursor = 0; return; }
-  if (haveSel) {
-    const int i = findItem(selKey);
-    if (i >= 0) cursor = i;
-  }
-  if (cursor >= n) cursor = n - 1;
-  memcpy(selKey, itemKey(cursor), 6);
-  haveSel = true;
+const ItemSource& items() {
+  return radio == Radio::WiFi ? static_cast<const ItemSource&>(wifiItems)
+                              : static_cast<const ItemSource&>(bleItems);
 }
+
+int itemCount() { return items().count(); }
 
 // Make the highlighted item the one Details and Track show.
 void targetFromCursor() {
   if (itemCount() == 0) return;
   if (radio == Radio::WiFi) {
-    strlcpy(trackSsid, aps[cursor].ssid, sizeof trackSsid);
-    memcpy(trackBssid, aps[cursor].bssid, 6);
+    strlcpy(trackSsid, wifi.aps[nav.cursor].ssid, sizeof trackSsid);
+    memcpy(trackBssid, wifi.aps[nav.cursor].bssid, 6);
     trackHidden = (trackSsid[0] == '\0');
   } else {
-    memcpy(trackAddr, bles[cursor].addr, 6);
-    strlcpy(trackName, bles[cursor].name, sizeof trackName);
+    memcpy(trackAddr, ble.devs[nav.cursor].addr, 6);
+    strlcpy(trackName, ble.devs[nav.cursor].name, sizeof trackName);
   }
 }
 
@@ -596,11 +289,9 @@ void setRadio(Radio r) {
     bleScan->stop();
   }
   radio = r;
-  view = View::List;
-  cursor = 0;
-  haveSel = false;
-  apCount = 0;
-  bleCount = 0;
+  nav.reset();
+  wifi.clear();
+  ble.clear();
   if (radio == Radio::WiFi) {
     nextScanMs = millis() + SCAN_GAP_MS;
   } else {
@@ -618,85 +309,33 @@ void toggleRadio() { setRadio(radio == Radio::WiFi ? Radio::Ble : Radio::WiFi); 
 // Logged whenever the button changes what is on screen, so a laptop log shows
 // which item was being looked at when.
 void logView() {
-  static const char* const names[] = {"list", "details", "track", "channels"};
   Serial.printf("{\"event\":\"view\",\"ms\":%lu,\"view\":\"%s\",\"cursor\":%d",
-                (unsigned long)millis(), names[static_cast<int>(view)], cursor);
-  if (haveSel) {
-    Serial.printf(",\"key\":\"%02X:%02X:%02X:%02X:%02X:%02X\"",
-                  selKey[0], selKey[1], selKey[2], selKey[3], selKey[4], selKey[5]);
+                (unsigned long)millis(), viewName(nav.view), nav.cursor);
+  if (nav.haveSel) {
+    char key[18];
+    macText(nav.selKey, key, sizeof key);
+    Serial.printf(",\"key\":\"%s\"", key);
   }
   Serial.println("}");
 }
 
+// Hold: next item.
 void onNext() {
-  const int n = itemCount();
-  if (n > 0 && view != View::Channels) {
-    resyncCursor();
-    cursor = (cursor + 1) % n;
-    memcpy(selKey, itemKey(cursor), 6);
-    haveSel = true;
-    if (view != View::List) targetFromCursor();
-  }
+  if (nav.next(items())) targetFromCursor();
   logView();
   dirty = true;
 }
 
+// Press: next nav.view.
 void onCycleView() {
-  switch (view) {
-    case View::List:
-      if (itemCount() == 0) {
-        if (radio == Radio::WiFi) view = View::Channels;
-        break;
-      }
-      resyncCursor();
-      targetFromCursor();
-      view = View::Details;
-      break;
-    case View::Details:  view = View::Track; break;
-    case View::Track:    view = (radio == Radio::WiFi) ? View::Channels : View::List; break;
-    case View::Channels: view = View::List; break;
-  }
+  if (nav.cycle(items(), radio == Radio::WiFi)) targetFromCursor();
   logView();
   dirty = true;
 }
 
-enum class Gesture { None, Press, DoublePress, Hold };
+ButtonDecoder button;
 
-// Press = one short press, reported DOUBLE_MS after release once it is clear a
-// second one is not coming. Hold fires while the button is still down, after
-// LONG_PRESS_MS, and again every HOLD_REPEAT_MS for as long as it stays down.
-Gesture pollButton() {
-  static bool     down = false;
-  static bool     holdFired = false;
-  static int      presses = 0;
-  static uint32_t tDown = 0;
-  static uint32_t tUp = 0;
-  static uint32_t tHold = 0;
-  const bool pressed = digitalRead(BTN_PIN) == LOW;
-  const uint32_t now = millis();
-  if (pressed && !down) {
-    down = true; tDown = now; holdFired = false;
-  } else if (pressed && down && !holdFired && now - tDown >= LONG_PRESS_MS) {
-    holdFired = true;
-    presses = 0;
-    tHold = now;
-    return Gesture::Hold;
-  } else if (pressed && down && holdFired && now - tHold >= HOLD_REPEAT_MS) {
-    tHold = now;
-    return Gesture::Hold;
-  } else if (!pressed && down) {
-    down = false;
-    if (!holdFired && now - tDown >= DEBOUNCE_MS) {
-      tUp = now;
-      if (++presses >= 2) { presses = 0; return Gesture::DoublePress; }
-    }
-  }
-  if (!down && presses == 1 && now - tUp >= DOUBLE_MS) {
-    presses = 0;
-    return Gesture::Press;
-  }
-  return Gesture::None;
-}
+Gesture pollButton() { return button.update(digitalRead(BTN_PIN) == LOW, millis()); }
 
 void pollSerial() {
   while (Serial.available() > 0) {
@@ -781,7 +420,7 @@ struct RowInfo {
 
 template <typename F>
 void drawRows(const RssiScale& sc, int count, F rowOf) {
-  const int first = (cursor / LIST_ROWS) * LIST_ROWS;
+  const int first = (nav.cursor / LIST_ROWS) * LIST_ROWS;
   for (int row = 0; row < LIST_ROWS; ++row) {
     const int i = first + row;
     if (i >= count) break;
@@ -790,7 +429,7 @@ void drawRows(const RssiScale& sc, int count, F rowOf) {
     const int y = 11 + row * 10;
     const uint16_t c = rssiColor(ri.rssi, sc);
 
-    if (i == cursor) frame.fillRect(0, y - 1, W, 10, C_ROWSEL);
+    if (i == nav.cursor) frame.fillRect(0, y - 1, W, 10, C_ROWSEL);
 
     drawBars(2, y + 8, ri.rssi, ri.fresh ? c : C_DIM, sc);
 
@@ -817,7 +456,7 @@ void drawList() {
   else                      snprintf(hdr, sizeof hdr, "BLE  %d dev%s", n, n == 1 ? "" : "s");
   char pg[16];
   const int pages = n ? (n + LIST_ROWS - 1) / LIST_ROWS : 1;
-  snprintf(pg, sizeof pg, "%d/%d %s", n ? cursor / LIST_ROWS + 1 : 1, pages, spinner());
+  snprintf(pg, sizeof pg, "%d/%d %s", n ? nav.cursor / LIST_ROWS + 1 : 1, pages, spinner());
   drawHeader(hdr, pg);
 
   if (n == 0) {
@@ -830,26 +469,26 @@ void drawList() {
 
   if (radio == Radio::WiFi) {
     drawRows(WIFI_SCALE, n, [](int i, RowInfo& r) {
-      const Ap& a = aps[i];
+      const Ap& a = wifi.aps[i];
       apName(a, r.name, 14);                       // 13 characters fit before the channel column
       snprintf(r.mid, sizeof r.mid, "%u", a.channel);
       r.rssi = a.rssi;
-      r.fresh = (a.lastSeen == scanNo);
+      r.fresh = (a.lastSeen == wifi.scanNo);
       r.dimName = (a.ssid[0] == '\0');
     });
-    const Ap& sel = aps[cursor];
-    ledForRssi(sel.rssi, sel.lastSeen == scanNo, WIFI_SCALE);
+    const Ap& sel = wifi.aps[nav.cursor];
+    ledForRssi(sel.rssi, sel.lastSeen == wifi.scanNo, WIFI_SCALE);
   } else {
     const uint32_t now = millis();
     drawRows(BLE_SCALE, n, [now](int i, RowInfo& r) {
-      const BleDev& d = bles[i];
+      const BleDev& d = ble.devs[i];
       bleName(d, r.name, 12);                      // 11 characters leave room for the maker tag
       strlcpy(r.mid, d.tag, sizeof r.mid);
       r.rssi = d.rssi;
       r.fresh = (now - d.lastSeenMs < BLE_FRESH_MS);
       r.dimName = (d.name[0] == '\0');
     });
-    const BleDev& sel = bles[cursor];
+    const BleDev& sel = ble.devs[nav.cursor];
     ledForRssi(sel.rssi, now - sel.lastSeenMs < BLE_FRESH_MS, BLE_SCALE);
   }
 }
@@ -878,15 +517,15 @@ void detailLine(int y, const char* left, uint16_t leftColor, const char* right =
 }
 
 void drawDetails() {
-  const int i = findAp(trackBssid);
+  const int i = wifi.find(trackBssid);
   char hdr[24];
   if (trackHidden) strlcpy(hdr, "<hidden>", sizeof hdr);
   else             strlcpy(hdr, trackSsid, sizeof hdr);
   drawHeader(hdr, spinner());
   if (i < 0) { drawNotInRange(); return; }
 
-  const Ap& a = aps[i];
-  const bool fresh = (a.lastSeen == scanNo);
+  const Ap& a = wifi.aps[i];
+  const bool fresh = (a.lastSeen == wifi.scanNo);
   const uint16_t c = rssiColor(a.rssi, WIFI_SCALE);
   const uint16_t cc = fresh ? c : C_DIM;
   char l[32], r[32];
@@ -908,7 +547,7 @@ void drawDetails() {
   snprintf(l, sizeof l, "now %d  avg %d", (int)a.lastRssi, (int)a.rssi);
   detailLine(42, l, C_DIM, rssiWord(a.rssi, WIFI_SCALE), cc);
 
-  const uint32_t sweeps = scanNo - a.firstSeen + 1;
+  const uint32_t sweeps = wifi.scanNo - a.firstSeen + 1;
   snprintf(l, sizeof l, "heard %lu of %lu sweeps", (unsigned long)a.seenCount, (unsigned long)sweeps);
   detailLine(52, l, C_DIM);
 
@@ -916,14 +555,9 @@ void drawDetails() {
   if (trackHidden) {
     strlcpy(l, "hidden SSID", sizeof l);
   } else {
-    int more = 0, bestRssi = -127, bestCh = 0;
-    for (int k = 0; k < apCount; ++k) {
-      if (k == i || strcmp(aps[k].ssid, trackSsid) != 0) continue;
-      ++more;
-      if (aps[k].rssi > bestRssi) { bestRssi = aps[k].rssi; bestCh = aps[k].channel; }
-    }
-    if (more == 0) strlcpy(l, "only AP with this SSID", sizeof l);
-    else snprintf(l, sizeof l, "+%d same SSID, best %d ch%d", more, bestRssi, bestCh);
+    const WifiTable::Siblings sib = wifi.siblings(i);
+    if (sib.more == 0) strlcpy(l, "only AP with this SSID", sizeof l);
+    else snprintf(l, sizeof l, "+%d same SSID, best %d ch%d", sib.more, sib.bestRssi, sib.bestCh);
   }
   detailLine(62, l, C_DIM);
 
@@ -932,14 +566,14 @@ void drawDetails() {
 }
 
 void drawBleDetails() {
-  const int i = findBle(trackAddr);
+  const int i = ble.find(trackAddr);
   char hdr[24];
   if (trackName[0]) strlcpy(hdr, trackName, sizeof hdr);
   else snprintf(hdr, sizeof hdr, "%02X:%02X:%02X", trackAddr[3], trackAddr[4], trackAddr[5]);
   drawHeader(hdr, spinner());
   if (i < 0) { drawNotInRange(); return; }
 
-  const BleDev& d = bles[i];
+  const BleDev& d = ble.devs[i];
   const uint32_t now = millis();
   const uint32_t age = now - d.lastSeenMs;
   const bool fresh = (age < BLE_FRESH_MS);
@@ -1003,8 +637,8 @@ void drawTrack() {
   // Gather the APs that belong to the tracked network, strongest first.
   const Ap* hits[MAX_APS];
   int nHits = 0;
-  for (int i = 0; i < apCount; ++i)
-    if (isTracked(aps[i])) hits[nHits++] = &aps[i];
+  for (int i = 0; i < wifi.count; ++i)
+    if (isTracked(wifi.aps[i])) hits[nHits++] = &wifi.aps[i];
 
   char hdr[24];
   if (trackHidden) strlcpy(hdr, "<hidden>", sizeof hdr);
@@ -1016,7 +650,7 @@ void drawTrack() {
   if (nHits == 0) { drawNotInRange(); return; }
 
   const Ap& best = *hits[0];
-  const bool fresh = (best.lastSeen == scanNo);
+  const bool fresh = (best.lastSeen == wifi.scanNo);
   const uint16_t c = rssiColor(best.rssi, WIFI_SCALE);
 
   // Big number for the strongest AP.
@@ -1046,7 +680,7 @@ void drawTrack() {
   for (int k = 1; k < nHits && k <= 3; ++k) {
     const Ap& a = *hits[k];
     const int y = 50 + (k - 1) * 10;
-    const bool f = (a.lastSeen == scanNo);
+    const bool f = (a.lastSeen == wifi.scanNo);
     snprintf(mac, sizeof mac, "%02X:%02X:%02X", a.bssid[3], a.bssid[4], a.bssid[5]);
     frame.setTextDatum(TL_DATUM);
     frame.setTextColor(C_DIM);
@@ -1069,18 +703,18 @@ void drawTrack() {
 }
 
 void drawBleTrack() {
-  const int i = findBle(trackAddr);
+  const int i = ble.find(trackAddr);
 
   char hdr[24];
   if (trackName[0]) strlcpy(hdr, trackName, sizeof hdr);
   else snprintf(hdr, sizeof hdr, "%02X:%02X:%02X", trackAddr[3], trackAddr[4], trackAddr[5]);
   char right[12];
-  snprintf(right, sizeof right, "%s %s", i >= 0 ? bles[i].tag : "", spinner());
+  snprintf(right, sizeof right, "%s %s", i >= 0 ? ble.devs[i].tag : "", spinner());
   drawHeader(hdr, right);
 
   if (i < 0) { drawNotInRange(); return; }
 
-  const BleDev& d = bles[i];
+  const BleDev& d = ble.devs[i];
   const uint32_t now = millis();
   const uint32_t age = now - d.lastSeenMs;
   const bool fresh = (age < BLE_FRESH_MS);
@@ -1123,20 +757,10 @@ void drawBleTrack() {
 }
 
 void drawChannels() {
-  int counts[14] = {0};
-  int strongest[14];
-  for (int c = 0; c < 14; ++c) strongest[c] = -127;
-  int maxCount = 1;
-  for (int i = 0; i < apCount; ++i) {
-    const int ch = aps[i].channel;
-    if (ch < 1 || ch > 13) continue;
-    counts[ch]++;
-    if (aps[i].rssi > strongest[ch]) strongest[ch] = aps[i].rssi;
-    if (counts[ch] > maxCount) maxCount = counts[ch];
-  }
+  const WifiTable::ChannelLoad load = wifi.channelLoad();
 
   char hdr[32];
-  snprintf(hdr, sizeof hdr, "Channel load  %d APs", apCount);
+  snprintf(hdr, sizeof hdr, "Channel load  %d APs", wifi.count);
   drawHeader(hdr, spinner());
 
   const int baseY = 66, maxH = 44;
@@ -1145,12 +769,12 @@ void drawChannels() {
     const int x = 2 + (ch - 1) * 12;
     const bool primary = (ch == 1 || ch == 6 || ch == 11);
     frame.drawFastHLine(x, baseY, 10, primary ? C_DIM : C_FAINT);
-    if (counts[ch]) {
-      const int h = std::max(2, counts[ch] * maxH / maxCount);
+    if (load.count[ch]) {
+      const int h = std::max(2, load.count[ch] * maxH / load.maxCount);
       // Bar colour: how loud the strongest AP on that channel is (louder = more contention).
-      frame.fillRect(x, baseY - h, 10, h, rssiColor(strongest[ch], WIFI_SCALE));
+      frame.fillRect(x, baseY - h, 10, h, rssiColor(load.strongest[ch], WIFI_SCALE));
       char n[4];
-      snprintf(n, sizeof n, "%d", counts[ch]);
+      snprintf(n, sizeof n, "%d", load.count[ch]);
       frame.setTextDatum(BC_DATUM);
       frame.setTextColor(C_TEXT);
       frame.drawString(n, x + 5, baseY - h - 1);
@@ -1166,7 +790,7 @@ void drawChannels() {
 
 void render() {
   frame.fillSprite(C_BG);
-  switch (view) {
+  switch (nav.view) {
     case View::List:     drawList(); break;
     case View::Details:  if (radio == Radio::WiFi) drawDetails(); else drawBleDetails(); break;
     case View::Track:    if (radio == Radio::WiFi) drawTrack();   else drawBleTrack();   break;
@@ -1184,7 +808,7 @@ void serviceWifi() {
       WiFi.scanDelete();
       scanning = false;
       nextScanMs = millis() + SCAN_GAP_MS;
-      resyncCursor();
+      nav.resync(items());
       dirty = true;
     } else if (millis() - scanStartedMs > SCAN_WATCHDOG_MS) {
       Serial.println("{\"event\":\"scan_timeout\"}");
@@ -1201,20 +825,13 @@ void serviceBle() {
 
   BleAdv a;
   for (int budget = 64; budget > 0 && xQueueReceive(bleQueue, &a, 0) == pdTRUE; --budget)
-    ingestBle(a);
+    ble.ingest(a, millis());
 
   const uint32_t now = millis();
   if (now - lastTidy >= BLE_TIDY_MS) {
     lastTidy = now;
-    int w = 0;
-    for (int r = 0; r < bleCount; ++r)
-      if (now - bles[r].lastSeenMs < BLE_STALE_MS) bles[w++] = bles[r];
-    bleCount = w;
-    std::sort(bles, bles + bleCount, [](const BleDev& x, const BleDev& y) {
-      if (x.rssi != y.rssi) return x.rssi > y.rssi;
-      return memcmp(x.addr, y.addr, 6) < 0;
-    });
-    resyncCursor();
+    ble.tidy(now);
+    nav.resync(items());
     dirty = true;
   }
   if (now - lastLog >= BLE_LOG_MS) {
@@ -1232,7 +849,6 @@ void serviceBle() {
 }  // namespace
 
 // ---------------------------------------------------------------- Arduino ---
-// cppcheck-suppress unusedFunction ; Arduino entry point
 void setup() {
   // A sweep logs ~3 KB in one burst; give the USB CDC driver room so nothing is
   // dropped if the host is slow to drain it.
@@ -1284,7 +900,6 @@ void setup() {
   startScan();
 }
 
-// cppcheck-suppress unusedFunction ; Arduino entry point
 void loop() {
   switch (pollButton()) {
     case Gesture::Press:       onCycleView();  break;

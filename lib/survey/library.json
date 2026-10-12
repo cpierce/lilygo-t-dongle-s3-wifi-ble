@@ -1,0 +1,10 @@
+{
+  "name": "survey",
+  "version": "1.0.0",
+  "description": "Radio-independent logic for the T-Dongle-S3 survey firmware: tables, button decoding, log formatting. No Arduino dependency so it can be unit-tested on the host.",
+  "license": "MIT",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src"
+  }
+}
